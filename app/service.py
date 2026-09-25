@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from typing import Any
 
@@ -835,6 +835,17 @@ def process_reverse_plan(
 
 
 # ------------------------------------------------------------ 理想溶液平衡组成
+def _fraction_to_decimal(value: Fraction) -> Decimal:
+    """把正有理数近似转换为 :class:`Decimal`（30 位有效数字）。
+
+    仅用于向 :func:`fraction_to_decimal_string` 传递绝对精度阈值
+    （该函数只取阈值的数量级决定追加多少有效位），不参与计算结果本身。
+    """
+    with localcontext() as ctx:
+        ctx.prec = 30
+        return Decimal(value.numerator) / Decimal(value.denominator)
+
+
 def process_equilibrium(
     reactant_texts: list[str],
     product_texts: list[str],
@@ -1002,10 +1013,16 @@ def process_equilibrium(
         kc_fraction,
     )
 
-    # 进度与摩尔数渲染：绝对舍入误差 < 1e-20 mol（远小于二分半宽 5e-10），
-    # 保证近完全反应的微小残余量不会被渲染舍入抹到区间端点；返回进度的
-    # 总绝对误差上界 < 5.1e-10 mol（规范要求 < 1e-9 mol）
-    mole_accuracy = Decimal("1e-20")
+    # 进度与摩尔数渲染精度：贴近物料区间端点时 Qc 对 ξ 的对数斜率
+    # S = dlnQc/dξ 极大（~ 计量系数 ÷ 端点残余量），固定绝对精度会把
+    # 微量剩余抹掉，使按响应数值复算的反应商严重偏离 Kc。取
+    # min(1e-20, 1e-12/S)：渲染引入的 Qc 相对漂移不超过 ~1e-12，
+    # 与求解器 1e-9 的内部误差合并后仍远严于规范要求的 1e-6；
+    # 常规情形（S < 1e8）退化为既有的 1e-20 绝对精度，返回进度的
+    # 总绝对误差上界 < 5e-10 + 1e-20 mol（规范要求 < 1e-9 mol）
+    base_accuracy = Fraction(1, 10**20)
+    slope_accuracy = Fraction(1, 10**12) / solution.qc_log_slope
+    mole_accuracy = _fraction_to_decimal(min(base_accuracy, slope_accuracy))
 
     def render(value: Fraction) -> str:
         return fraction_to_decimal_string(

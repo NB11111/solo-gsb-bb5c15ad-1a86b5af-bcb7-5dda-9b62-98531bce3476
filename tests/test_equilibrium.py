@@ -229,6 +229,108 @@ def test_very_small_kc_drives_reverse_near_completion():
     )
 
 
+# ------------------------------------------------------------ 极端平衡常数
+def _reference_root(d, iterations=600):
+    """独立精确二分 Qc(ξ)=Kc 的参考根（与求解器终止准则无关）。"""
+    species = d["reactants"] + d["products"]
+    reactants = [x["normalized"] for x in d["reactants"]]
+    products = [x["normalized"] for x in d["products"]]
+    n0 = {x["normalized"]: Fraction(x["initial_moles"]) for x in species}
+    coef = {x["normalized"]: x["coefficient"] for x in species}
+    volume = Fraction(d["volume_l"])
+    kc = Fraction(d["kc"])
+    lo = Fraction(Decimal(d["extent_bounds"]["minimum"]))
+    hi = Fraction(Decimal(d["extent_bounds"]["maximum"]))
+    if _exact_qc(d, Fraction(0), n0, coef, reactants, products, volume) > kc:
+        hi = Fraction(0)
+    else:
+        lo = Fraction(0)
+    for _ in range(iterations):
+        mid = (lo + hi) / 2
+        if _exact_qc(d, mid, n0, coef, reactants, products, volume) > kc:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def assert_extreme_kc_consistent(d):
+    """极端 Kc 核验：内部 Qc、按响应进度/摩尔数复算的 Qc 相对 Kc 误差
+    均 ≤ 1e-6，且响应进度距独立参考根 < 1e-9 mol、摩尔数非负。"""
+    species = d["reactants"] + d["products"]
+    reactants = [x["normalized"] for x in d["reactants"]]
+    products = [x["normalized"] for x in d["products"]]
+    n0 = {x["normalized"]: Fraction(x["initial_moles"]) for x in species}
+    coef = {x["normalized"]: x["coefficient"] for x in species}
+    volume = Fraction(d["volume_l"])
+    kc = Fraction(d["kc"])
+    rel_tol = Fraction(1, 10**6)
+
+    # 内部平衡反应商相对 Kc 的误差 ≤ 1e-6
+    eq_qc = Fraction(Decimal(d["equilibrium_qc"]))
+    assert abs(eq_qc / kc - 1) <= rel_tol
+
+    # 响应进度落在物料区间且距独立参考根 < 1e-9 mol
+    xi = Fraction(Decimal(d["reaction_extent"]["value"]))
+    lo_bound = Fraction(Decimal(d["extent_bounds"]["minimum"]))
+    hi_bound = Fraction(Decimal(d["extent_bounds"]["maximum"]))
+    assert lo_bound <= xi <= hi_bound
+    assert abs(xi - _reference_root(d)) < Fraction(1, 10**9)
+
+    # 按响应进度复算的反应商相对 Kc 的误差 ≤ 1e-6
+    q_from_extent = _exact_qc(d, xi, n0, coef, reactants, products, volume)
+    assert abs(q_from_extent / kc - 1) <= rel_tol
+
+    # 按响应平衡摩尔数复算的反应商相对 Kc 的误差 ≤ 1e-6，摩尔数非负
+    eq_moles = {
+        x["normalized"]: Fraction(Decimal(x["equilibrium_moles"]))
+        for x in species
+    }
+    num = Fraction(1)
+    for s in products:
+        num *= eq_moles[s] ** coef[s]
+    den = Fraction(1)
+    for s in reactants:
+        den *= eq_moles[s] ** coef[s]
+    delta_n = sum(coef[s] for s in products) - sum(coef[s] for s in reactants)
+    q_from_moles = num / (den * volume ** delta_n)
+    assert abs(q_from_moles / kc - 1) <= rel_tol
+    for value in eq_moles.values():
+        assert value >= 0
+
+
+def test_extreme_tiny_kc_reverse_near_endpoint():
+    # 2O3 ⇌ 3O2：初始 (2, 3)，V=1，Kc=1e-100 -> 逆向贴近 ξ_min = -1
+    resp = client.post(
+        PATH,
+        json=_body(["O3"], ["O2"], {"O3": "2", "O2": "3"}, kc="1e-100"),
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()
+    assert d["direction"] == "reverse"
+    assert_extreme_kc_consistent(d)
+    blocks = {x["normalized"]: x for x in d["reactants"] + d["products"]}
+    # 近端点的微量剩余必须保留：O2 剩余 ~1e-33 mol，不得被抹成 0
+    residual = Decimal(blocks["O2"]["equilibrium_moles"])
+    assert Decimal(0) < residual < Decimal("1e-30")
+
+
+def test_extreme_huge_kc_forward_near_endpoint():
+    # 2O3 ⇌ 3O2：初始 (2, 3)，V=1，Kc=1e100 -> 正向贴近 ξ_max = 1
+    resp = client.post(
+        PATH,
+        json=_body(["O3"], ["O2"], {"O3": "2", "O2": "3"}, kc="1e100"),
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()
+    assert d["direction"] == "forward"
+    assert_extreme_kc_consistent(d)
+    blocks = {x["normalized"]: x for x in d["reactants"] + d["products"]}
+    # 近端点的微量剩余必须保留：O3 剩余 ~1e-49 mol，不得被抹成 0
+    residual = Decimal(blocks["O3"]["equilibrium_moles"])
+    assert Decimal(0) < residual < Decimal("1e-45")
+
+
 def test_ionic_reaction_charge_balanced():
     # CH3COOH ⇌ CH3COO- + H+
     resp = client.post(

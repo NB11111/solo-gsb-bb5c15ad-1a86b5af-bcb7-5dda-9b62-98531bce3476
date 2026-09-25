@@ -27,14 +27,22 @@ Qc 在 (ξ_min, ξ_max) 上关于 ξ 严格单调递增（端点处取 0 / +∞�
 * Qc(0) = Kc：初始即平衡，ξ = 0。
 
 求解全程采用 :class:`fractions.Fraction` 二分（符号判定逐位精确，绝无
-浮点抵消或误判）。终止准则要求区间宽度同时满足：
+浮点抵消或误判）。每次迭代取中点并精确计算 f = num − Kc·den（与
+Qc − Kc 同号且严格递增），以下两个终止准则**同时**满足时返回该中点：
 
-* 绝对宽度 < 1e-9 mol（中点绝对误差 < 5e-10 mol）；
-* 相对宽度 < 初始区间尺度 × 1e-32，保证任意数量级输入下内点都有
-  至少 32 位有效数字，28 位有效数字渲染不会把内点抹到区间端点。
+* 进度精度：中点成为新区间端点后区间宽度 < 5e-10 mol，故返回点距真根
+  不超过 5e-10 mol（规范要求绝对误差 < 1e-9 mol）；
+* 反应商精度：|Qc(ξ)/Kc − 1| = |f| / (Kc·den) ≤ 1e-9。贴近物料区间
+  端点时 Qc 对 ξ 极其平缓（dlnQc/dξ ~ 计量系数 ÷ 端点残余量），任何
+  固定的进度宽度准则都会在 Qc 仍偏离 Kc 数个数量级时提前停下（如
+  Kc = 1e∓100 时偏差达数百倍乃至 1e±33）；相对误差准则迫使二分在
+  非负物料区间内继续逼近，保证任意数量级 Kc 下内部反应商都贴合 Kc，
+  且远严于规范要求的 1e-6，为输出渲染留足余量。
 
-极端输入（如 1e±30）下对分次数约 250 次、分数位数数百位，仍在毫秒级；
-最终进度与各物种平衡摩尔数均为精确有理数，仅在 API 渲染层转十进制。
+极端输入（如 Kc = 1e±100）下对分次数约 350 次、分数位数数百位，仍在
+毫秒级；最终进度与各物种平衡摩尔数均为精确有理数，仅在 API 渲染层转
+十进制。返回解同时给出解处对数斜率 S = dlnQc/dξ（精确有理数），供
+渲染层按 1/S 量级自适应选择绝对精度，避免把贴近端点的微量剩余抹掉。
 """
 
 from __future__ import annotations
@@ -46,15 +54,17 @@ from typing import Iterable
 from .balancer import Species
 from .cache import species_key
 
-# 二分区间宽度容差：宽度 < 1e-9 mol 时取中点，绝对误差 < 5e-10 mol
-WIDTH_TOL = Fraction(1, 10**9)
+# 进度宽度容差：返回点距真根不超过当前区间宽度，宽度 < 5e-10 mol 时
+# 进度绝对误差 < 5e-10 mol（规范要求 < 1e-9 mol）
+WIDTH_TOL = Fraction(5, 10**10)
 
-# 相对容差：区间宽度 < 搜索区间尺度 × 10^-_RELATIVE_WIDTH_POW，
-# 保证任意数量级下内点都有至少 32 位有效数字
-RELATIVE_WIDTH_POW = 32
+# 反应商相对容差：|Qc(ξ)/Kc − 1| ≤ 1e-9 才允许停止，
+# 远严于规范要求的 1e-6，为输出渲染的舍入留足余量
+QC_REL_TOL = Fraction(1, 10**9)
 
-# 对分次数保护上限：正常情形约 60（常规数量级）～250（极端数量级）次
-MAX_BISECTION_ITERS = 1_000
+# 对分次数保护上限：常规数量级约 60 次，Kc = 1e±100 约 350 次，
+# 输入允许的最大数量级（1e±10000）约 3.5 万次
+MAX_BISECTION_ITERS = 100_000
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,9 @@ class EquilibriumSolution:
     equilibrium_qc: Fraction
     equilibrium_moles: dict[str, Fraction]
     iterations: int
+    # 解处对数斜率 S = dlnQc/dξ = Σ系数²/摩尔数（恒正），
+    # 供渲染层按 1/S 量级选择绝对精度，保留贴近端点的微量剩余
+    qc_log_slope: Fraction
 
 
 def _qc_parts(
@@ -92,18 +105,6 @@ def _qc_parts(
     delta_n = sum(coef[k] for k in p_keys) - sum(coef[k] for k in r_keys)
     den *= volume ** delta_n
     return num, den
-
-
-def _width_sufficient(width: Fraction, span: Fraction) -> bool:
-    """对分终止准则：宽度同时满足绝对容差与相对容差。
-
-    绝对：width < 1e-9 mol（中点绝对误差 < 5e-10 mol）；
-    相对：width < span·1e-32，按初始搜索区间尺度衡量，即使进度本身接近
-    0 也保证 32 位有效数字，28 位有效数字渲染不会把内点抹到区间端点。
-    """
-    if width >= WIDTH_TOL:
-        return False
-    return width < span / 10**RELATIVE_WIDTH_POW
 
 
 def solve_equilibrium(
@@ -130,7 +131,6 @@ def solve_equilibrium(
     # 非负物料区间：ξ_min = -min_生成物(n0/b)，ξ_max = min_反应物(n0/a)
     extent_min = -min(n0[k] / coef[k] for k in p_keys)
     extent_max = min(n0[k] / coef[k] for k in r_keys)
-    span = max(abs(extent_min), abs(extent_max))
 
     num0, den0 = _qc_parts(Fraction(0), r_keys, p_keys, coef, n0, volume)
     initial_qc = num0 / den0
@@ -150,21 +150,24 @@ def solve_equilibrium(
 
     # ---- 精确有理数二分：f = num - Kc·den，与 Qc-Kc 同号且严格递增
     iterations = 0
+    extent: Fraction | None = None
     for iterations in range(1, MAX_BISECTION_ITERS + 1):
-        if _width_sufficient(hi - lo, span):
-            extent = (lo + hi) / 2
-            break
         mid = (lo + hi) / 2
         num, den = _qc_parts(mid, r_keys, p_keys, coef, n0, volume)
         diff = num - kc * den
         if diff == 0:
-            extent = mid
+            extent = mid  # 精确命中根
             break
         if diff > 0:
             hi = mid
         else:
             lo = mid
-    else:  # pragma: no cover - 保护上限远超任何合法输入所需次数
+        # mid 已成为新区间端点：|mid − 真根| < hi − lo；
+        # Qc(mid)/Kc − 1 = diff / (Kc·den)，两个终止准则同时满足才返回
+        if (hi - lo) < WIDTH_TOL and abs(diff) <= QC_REL_TOL * kc * den:
+            extent = mid
+            break
+    if extent is None:  # pragma: no cover - 保护上限远超任何合法输入所需次数
         extent = (lo + hi) / 2
 
     return _build_solution(
@@ -203,6 +206,8 @@ def _build_solution(
         den *= moles[k] ** coef[k]
     delta_n = sum(coef[k] for k in p_keys) - sum(coef[k] for k in r_keys)
     den *= volume ** delta_n
+    # 解处对数斜率 S = dlnQc/dξ = Σ_生成物 b²/n_P + Σ_反应物 a²/n_R（恒正）
+    log_slope = sum(coef[k] ** 2 / moles[k] for k in (*r_keys, *p_keys))
     return EquilibriumSolution(
         extent=extent,
         extent_min=extent_min,
@@ -212,4 +217,5 @@ def _build_solution(
         equilibrium_qc=num / den,
         equilibrium_moles=moles,
         iterations=iterations,
+        qc_log_slope=log_slope,
     )
