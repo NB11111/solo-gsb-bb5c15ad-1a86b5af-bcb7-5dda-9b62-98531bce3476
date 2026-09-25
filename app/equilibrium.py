@@ -27,14 +27,21 @@ Qc 在 (ξ_min, ξ_max) 上关于 ξ 严格单调递增（端点处取 0 / +∞�
 * Qc(0) = Kc：初始即平衡，ξ = 0。
 
 求解全程采用 :class:`fractions.Fraction` 二分（符号判定逐位精确，绝无
-浮点抵消或误判）。终止准则要求区间宽度同时满足：
+浮点抵消或误判）。每次迭代在中点处同时检验两个终止准则：
 
-* 绝对宽度 < 1e-9 mol（中点绝对误差 < 5e-10 mol）；
-* 相对宽度 < 初始区间尺度 × 1e-32，保证任意数量级输入下内点都有
-  至少 32 位有效数字，28 位有效数字渲染不会把内点抹到区间端点。
+* 区间宽度 < 1e-9 mol（中点进度绝对误差 < 5e-10 mol）；
+* 反应商相对误差 |Qc(ξ)/Kc − 1| ≤ 1e-8，以精确有理数判定
+  |num − Kc·den| ≤ 1e-8·Kc·den（den > 0，diff 与 Qc − Kc 同号）。
 
-极端输入（如 1e±30）下对分次数约 250 次、分数位数数百位，仍在毫秒级；
-最终进度与各物种平衡摩尔数均为精确有理数，仅在 API 渲染层转十进制。
+第二个准则取代固定相对宽度：极端 Kc（如 1e±100）下唯一内点到物料端点
+的距离可小至 1e-34 ~ 1e-50 量级，任何与 Kc 无关的固定宽度都会提前停下，
+使 equilibrium_qc 偏离 Kc 数百倍甚至更多；改为按 Qc 相对误差继续逼近后，
+正向、逆向都能在非负物料区间内收敛到满足规范（≤ 1e-6）的内点。内部取
+1e-8，为输出渲染的舍入误差预留余量，使按响应数值复算的反应商同样达标。
+
+常规数量级约 30~60 次对分，Kc=1e±100 约 200 次，输入数量级上限
+（Kc=1e±10000）约 1.2 万次；最终进度与各物种平衡摩尔数均为精确有理数，
+仅在 API 渲染层转十进制。
 """
 
 from __future__ import annotations
@@ -49,12 +56,15 @@ from .cache import species_key
 # 二分区间宽度容差：宽度 < 1e-9 mol 时取中点，绝对误差 < 5e-10 mol
 WIDTH_TOL = Fraction(1, 10**9)
 
-# 相对容差：区间宽度 < 搜索区间尺度 × 10^-_RELATIVE_WIDTH_POW，
-# 保证任意数量级下内点都有至少 32 位有效数字
-RELATIVE_WIDTH_POW = 32
+# 内部反应商相对容差 |Qc(ξ*)/Kc − 1| ≤ 1e-8：极端 Kc 下唯一内点贴近物料
+# 端点（残余量可至 1e-50 量级），与 Kc 无关的固定区间宽度会提前停下，使
+# equilibrium_qc 偏离 Kc 数百倍甚至更多；按相对误差继续二分可在非负物料
+# 区间内收敛。规范要求 ≤ 1e-6，取 1e-8 为输出渲染的舍入误差预留余量
+QC_REL_TOL = Fraction(1, 10**8)
 
-# 对分次数保护上限：正常情形约 60（常规数量级）～250（极端数量级）次
-MAX_BISECTION_ITERS = 1_000
+# 对分次数保护上限：常规数量级约 30~60 次，Kc=1e±100 约 200 次，
+# Kc=1e±10000（输入数量级上限）约 1.2 万次
+MAX_BISECTION_ITERS = 100_000
 
 
 @dataclass(frozen=True)
@@ -94,16 +104,13 @@ def _qc_parts(
     return num, den
 
 
-def _width_sufficient(width: Fraction, span: Fraction) -> bool:
-    """对分终止准则：宽度同时满足绝对容差与相对容差。
+def _qc_close_enough(diff: Fraction, kc: Fraction, den: Fraction) -> bool:
+    """反应商终止准则：|Qc(ξ)/Kc − 1| ≤ 1e-8 的精确有理数判定。
 
-    绝对：width < 1e-9 mol（中点绝对误差 < 5e-10 mol）；
-    相对：width < span·1e-32，按初始搜索区间尺度衡量，即使进度本身接近
-    0 也保证 32 位有效数字，28 位有效数字渲染不会把内点抹到区间端点。
+    ``diff = num − Kc·den`` 与 Qc − Kc 同号（区间内 den > 0），故
+    |Qc/Kc − 1| = |diff| / (Kc·den)，无需除法即可精确判定。
     """
-    if width >= WIDTH_TOL:
-        return False
-    return width < span / 10**RELATIVE_WIDTH_POW
+    return abs(diff) <= QC_REL_TOL * kc * den
 
 
 def solve_equilibrium(
@@ -130,7 +137,6 @@ def solve_equilibrium(
     # 非负物料区间：ξ_min = -min_生成物(n0/b)，ξ_max = min_反应物(n0/a)
     extent_min = -min(n0[k] / coef[k] for k in p_keys)
     extent_max = min(n0[k] / coef[k] for k in r_keys)
-    span = max(abs(extent_min), abs(extent_max))
 
     num0, den0 = _qc_parts(Fraction(0), r_keys, p_keys, coef, n0, volume)
     initial_qc = num0 / den0
@@ -151,13 +157,16 @@ def solve_equilibrium(
     # ---- 精确有理数二分：f = num - Kc·den，与 Qc-Kc 同号且严格递增
     iterations = 0
     for iterations in range(1, MAX_BISECTION_ITERS + 1):
-        if _width_sufficient(hi - lo, span):
-            extent = (lo + hi) / 2
-            break
         mid = (lo + hi) / 2
         num, den = _qc_parts(mid, r_keys, p_keys, coef, n0, volume)
         diff = num - kc * den
         if diff == 0:
+            extent = mid
+            break
+        # 终止准则同时满足才收敛：区间宽度 < 1e-9 mol（中点进度绝对误差
+        # < 5e-10 mol），且中点反应商相对 Kc 的误差 ≤ 1e-8（极端 Kc 下
+        # 继续在非负物料区间内逼近，不按固定宽度提前停下）
+        if hi - lo < WIDTH_TOL and _qc_close_enough(diff, kc, den):
             extent = mid
             break
         if diff > 0:

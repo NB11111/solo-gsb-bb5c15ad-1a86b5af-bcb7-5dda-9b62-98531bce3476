@@ -835,6 +835,26 @@ def process_reverse_plan(
 
 
 # ------------------------------------------------------------ 理想溶液平衡组成
+def _extent_render_accuracy(
+    residual: Fraction, total_coefficient: int, fallback: Decimal
+) -> Decimal:
+    """按端点微量剩余折算的进度渲染绝对精度（10 的负幂 :class:`Decimal`）。
+
+    极端 Kc 下进度到最近物料端点的距离（微量剩余）可远小于 1e-20，固定
+    精度渲染会把它舍入抹掉。取最小的整数 P 使
+    10^-P < residual / (total_coefficient · 1e13)（用整数位数估计，自带
+    10~100 倍余量），再与兜底精度取更严格者；渲染引入的反应商相对误差
+    约 1e-13，远小于内部求解的 1e-8 余量。
+    """
+    if residual <= 0 or total_coefficient <= 0:  # 防御：合法解残余量恒为正
+        return fallback
+    scaled = total_coefficient * 10**13 * residual.denominator
+    places = len(str(scaled)) - len(str(residual.numerator)) + 1
+    if places <= -fallback.as_tuple().exponent:
+        return fallback
+    return Decimal(1).scaleb(-places)
+
+
 def process_equilibrium(
     reactant_texts: list[str],
     product_texts: list[str],
@@ -850,8 +870,8 @@ def process_equilibrium(
     一一对应且为**正**十进制字符串，体积 V（L）与 Kc 同样必须为正十进制
     字符串，问题聚合为 422 INVALID_REQUEST。校验通过后以
     :func:`app.equilibrium.solve_equilibrium` 二分求 Qc=Kc 的唯一内点
-    进度（绝对误差上界 5e-10 mol），返回进度、非负物料区间、初始/平衡
-    反应商与各物种初始/平衡摩尔数。
+    进度（绝对误差上界 5e-10 mol，平衡反应商相对 Kc 的误差 ≤ 1e-8），
+    返回进度、非负物料区间、初始/平衡反应商与各物种初始/平衡摩尔数。
     """
     # ---- 配平前预检：两侧重复物种对可逆反应永远非法（否则会被报成零系数，
     # 错误语义不直观）。任一侧无法解析时跳过预检，交由 process_balance 统一报 400。
@@ -1002,14 +1022,32 @@ def process_equilibrium(
         kc_fraction,
     )
 
-    # 进度与摩尔数渲染：绝对舍入误差 < 1e-20 mol（远小于二分半宽 5e-10），
+    # 摩尔数渲染：绝对舍入误差 < 1e-20 mol（远小于二分半宽 5e-10），
     # 保证近完全反应的微小残余量不会被渲染舍入抹到区间端点；返回进度的
     # 总绝对误差上界 < 5.1e-10 mol（规范要求 < 1e-9 mol）
     mole_accuracy = Decimal("1e-20")
 
+    # 进度与物料区间端点渲染：极端 Kc 下进度到最近端点的微量剩余可远小于
+    # 1e-20（如 Kc=1e100 时约 7e-50），固定精度会把它舍入抹掉。按残余量与
+    # 配平系数和折算渲染精度，使按响应进度复算的各物种摩尔数保留微量剩余、
+    # 复算反应商相对 Kc 的误差仍 ≤ 1e-6（内部求解已压到 1e-8，渲染引入
+    # 约 1e-13）；端点与进度同精度渲染，保持 ξ_min ≤ ξ ≤ ξ_max 不被舍入破坏
+    residual = min(
+        solution.extent - solution.extent_min,
+        solution.extent_max - solution.extent,
+    )
+    extent_accuracy = _extent_render_accuracy(
+        residual, sum(coefficient_map.values()), mole_accuracy
+    )
+
     def render(value: Fraction) -> str:
         return fraction_to_decimal_string(
             value, min_absolute_accuracy=mole_accuracy
+        )
+
+    def render_extent(value: Fraction) -> str:
+        return fraction_to_decimal_string(
+            value, min_absolute_accuracy=extent_accuracy
         )
 
     def species_block(side: list[Species]) -> list[dict[str, Any]]:
@@ -1035,12 +1073,12 @@ def process_equilibrium(
         "kc": kc_text,
         "direction": solution.direction,
         "reaction_extent": {
-            "value": render(solution.extent),
+            "value": render_extent(solution.extent),
             "unit": "mol",
         },
         "extent_bounds": {
-            "minimum": fraction_to_decimal_string(solution.extent_min),
-            "maximum": fraction_to_decimal_string(solution.extent_max),
+            "minimum": render_extent(solution.extent_min),
+            "maximum": render_extent(solution.extent_max),
         },
         "initial_qc": fraction_to_decimal_string(solution.initial_qc),
         "equilibrium_qc": fraction_to_decimal_string(solution.equilibrium_qc),

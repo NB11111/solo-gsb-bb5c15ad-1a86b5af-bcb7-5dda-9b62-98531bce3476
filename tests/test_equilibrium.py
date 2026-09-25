@@ -229,6 +229,135 @@ def test_very_small_kc_drives_reverse_near_completion():
     )
 
 
+def _reference_root(n0, coef, reactants, products, volume, kc):
+    """用 250 位 :class:`Decimal` 在非负物料区间内独立二分 Qc(ξ)=Kc 的根。
+
+    用于交叉核验返回进度的绝对误差（300 次对分后参考根误差 < 1e-90 mol，
+    远小于 1e-9 mol 的进度容差）。
+    """
+    with localcontext() as ctx:
+        ctx.prec = 250
+        n0d = {s: Decimal(n0[s].numerator) / Decimal(n0[s].denominator) for s in n0}
+        vd = Decimal(volume.numerator) / Decimal(volume.denominator)
+        kd = Decimal(kc.numerator) / Decimal(kc.denominator)
+        delta_n = sum(coef[s] for s in products) - sum(coef[s] for s in reactants)
+
+        def qc(x):
+            num = Decimal(1)
+            for s in products:
+                num *= (n0d[s] + coef[s] * x) ** coef[s]
+            den = vd ** delta_n
+            for s in reactants:
+                den *= (n0d[s] - coef[s] * x) ** coef[s]
+            return num / den
+
+        lo = -min(n0d[s] / coef[s] for s in products)
+        hi = min(n0d[s] / coef[s] for s in reactants)
+        if qc(Decimal(0)) > kd:
+            hi = Decimal(0)
+        else:
+            lo = Decimal(0)
+        for _ in range(300):
+            mid = (lo + hi) / 2
+            if qc(mid) > kd:
+                hi = mid
+            else:
+                lo = mid
+        return Fraction((lo + hi) / 2)
+
+
+def assert_extreme_kc_consistent(d, *, rel_tol=Fraction(1, 10**6)):
+    """核验极端 Kc 求解：内部/复算反应商相对 Kc 误差 ≤ rel_tol（规范 1e-6）、
+
+    各物种平衡摩尔数严格为正（近端点微量剩余被保留）、进度落在渲染后的
+    物料区间内、进度绝对误差 < 1e-9 mol（与独立高精度参考根对比）。
+    """
+    species = d["reactants"] + d["products"]
+    reactants = [x["normalized"] for x in d["reactants"]]
+    products = [x["normalized"] for x in d["products"]]
+    n0 = {x["normalized"]: Fraction(x["initial_moles"]) for x in species}
+    coef = {x["normalized"]: x["coefficient"] for x in species}
+    volume = Fraction(d["volume_l"])
+    kc = Fraction(d["kc"])
+    xi = Fraction(Decimal(d["reaction_extent"]["value"]))
+
+    # 内部反应商（响应字段 equilibrium_qc）
+    eq_qc = Fraction(Decimal(d["equilibrium_qc"]))
+    assert abs(eq_qc / kc - 1) <= rel_tol
+
+    # 按响应进度复算反应商
+    q_from_xi = _exact_qc(d, xi, n0, coef, reactants, products, volume)
+    assert abs(q_from_xi / kc - 1) <= rel_tol
+
+    # 按响应平衡摩尔数复算反应商
+    moles = {x["normalized"]: Fraction(Decimal(x["equilibrium_moles"])) for x in species}
+    num = Fraction(1)
+    for s in products:
+        num *= moles[s] ** coef[s]
+    den = Fraction(1)
+    for s in reactants:
+        den *= moles[s] ** coef[s]
+    delta_n = sum(coef[s] for s in products) - sum(coef[s] for s in reactants)
+    q_from_moles = num / (den * volume ** delta_n)
+    assert abs(q_from_moles / kc - 1) <= rel_tol
+
+    # 微量剩余保留：平衡摩尔数严格为正，进度不越出渲染后的物料区间
+    for x in species:
+        assert Fraction(Decimal(x["equilibrium_moles"])) > 0
+    lo_bound = Fraction(Decimal(d["extent_bounds"]["minimum"]))
+    hi_bound = Fraction(Decimal(d["extent_bounds"]["maximum"]))
+    assert lo_bound <= xi <= hi_bound
+
+    # 进度绝对误差 < 1e-9 mol
+    ref = _reference_root(n0, coef, reactants, products, volume, kc)
+    assert abs(xi - ref) < Fraction(1, 10**9)
+
+
+def test_extreme_small_kc_reverse_converges():
+    # 2O3 ⇌ 3O2：初始 (2, 3)，V=1，Kc=1e-100 -> 逆向近完全进行，
+    # 根 ξ ≈ -1 + 8.4e-34；固定相对宽度会提前停下（旧行为 Qc 偏差数百倍）
+    resp = client.post(
+        PATH,
+        json=_body(["O3"], ["O2"], {"O3": "2", "O2": "3"}, kc="1e-100"),
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()
+    assert d["direction"] == "reverse"
+    xi = Decimal(d["reaction_extent"]["value"])
+    assert Decimal("-1") < xi < Decimal("-0.999999999999999999999999999999")
+    assert_extreme_kc_consistent(d)
+
+
+def test_extreme_large_kc_forward_converges():
+    # 2O3 ⇌ 3O2：初始 (2, 3)，V=1，Kc=1e100 -> 正向近完全进行，
+    # 根 ξ ≈ 1 - 7.4e-50（旧行为 Qc 偏差约 1e35 倍）
+    resp = client.post(
+        PATH,
+        json=_body(["O3"], ["O2"], {"O3": "2", "O2": "3"}, kc="1e100"),
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()
+    assert d["direction"] == "forward"
+    xi = Decimal(d["reaction_extent"]["value"])
+    assert Decimal("0.999999999999999999999999999999") < xi < 1
+    assert_extreme_kc_consistent(d)
+
+
+def test_extreme_kc_nonterminating_extent_keeps_residual():
+    # 2O3 ⇌ 3O2：初始 (2, 1)，Kc=1e-100 -> 逆向根贴近 ξ_min = -1/3
+    # （非有限小数端点），检验自适应渲染精度保留微量剩余
+    resp = client.post(
+        PATH,
+        json=_body(["O3"], ["O2"], {"O3": "2", "O2": "1"}, kc="1e-100"),
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()
+    assert d["direction"] == "reverse"
+    assert d["extent_bounds"]["minimum"].startswith("-0.333333333333333333")
+    assert_extreme_kc_consistent(d)
+
+
+
 def test_ionic_reaction_charge_balanced():
     # CH3COOH ⇌ CH3COO- + H+
     resp = client.post(
